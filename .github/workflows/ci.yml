@@ -1,4 +1,4 @@
-# CI for a Coworld game repo (Metta-AI/cogame-cogplomacy).
+# CI for a Coworld game repo (softmax-universe/cogame-cogplomacy).
 #
 # Goes to:  .github/workflows/ci.yml  in the coworld repo.
 # Substitute: cogplomacy  (lowercase game slug, e.g. bullwhip)
