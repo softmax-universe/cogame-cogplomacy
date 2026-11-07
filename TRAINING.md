@@ -52,7 +52,7 @@ step on a tiny local model reduced validation loss from 5.5937 to 5.5037
 and 5.5368 to 5.4659. These short runs verify the training path, not policy
 quality.
 
-Use the [post-training research package](https://github.com/Metta-AI/posttraining-research/tree/main/packages/metta-posttraining)
+Use the [post-training research package](https://github.com/softmax-universe/posttraining-research/tree/main/packages/metta-posttraining)
 for current training and adapter-packaging workflows.
 
 
