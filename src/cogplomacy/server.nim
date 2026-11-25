@@ -20,7 +20,7 @@
 ##                   {"type":"final","scores":[...],"centres":[...]}
 ##   player -> game: {"type":"prompt","prompt":"...","scripted":"expander"}
 ##                   (max 4000 runes; scripted plays a built-in baseline for
-##                   that seat: "expander" / "1", or "hedgehog")
+##                   that seat: "expander" or "hedgehog"; "" means LLM-driven)
 
 import
   std/[json, locks, os, sets, strutils, tables, times, unicode],
@@ -50,6 +50,7 @@ type
     prompts: seq[string]
     scripted: seq[ScriptKind]
     promptSeen: seq[bool]
+    slotErrors: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -162,6 +163,44 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.tableStateJson())
 
+proc writePlayerFailure(failedSeat: int, reason: string) =
+  ## Atomically publishes a typed GamePlayerFailure to COGAME_PLAYER_FAILURE_URI.
+  let uri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if uri.len == 0:
+    return
+  let message = cleanText(oneLine(reason), 2000)
+  let payload = $ %*{
+    "message": (if message.len > 0: message else: "player decision failed"),
+    "failed_policy_index": max(failedSeat, 0)
+  }
+  const FilePrefix = "file://"
+  if uri.startsWith(FilePrefix):
+    let path = uri[FilePrefix.len .. ^1]
+    if path.len > 0:
+      let dir = path.parentDir()
+      if dir.len > 0:
+        createDir(dir)
+      let tmpPath = path & ".tmp." & $getCurrentProcessId()
+      writeFile(tmpPath, payload)
+      moveFile(tmpPath, path)
+  else:
+    writeArtifact(uri, payload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD")
+
+proc failEpisode(failedSeat: int, reason: string) =
+  ## Terminal explicit player failure: write GamePlayerFailure (never normal
+  ## results/replay), preserve trajectory evidence if enabled, and exit nonzero.
+  let cleanReason = cleanText(oneLine(reason), 2000)
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    state.trajectory.finishFailedTrajectory(failedSeat, cleanReason)
+  echo "cogplomacy: failing episode (slot ", failedSeat, "): ", cleanReason
+  writePlayerFailure(failedSeat, cleanReason)
+  sleep(200)
+  quit(1)
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
@@ -248,31 +287,45 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       sleep(200)
 
     ## Give the connected seats until the same connect deadline to deliver
-    ## their prompt frames; a seat that never delivers one plays the expander
-    ## baseline for the whole episode.
+    ## their prompt frames; a seat that never delivers a valid prompt fails the
+    ## episode explicitly rather than silently falling back to a baseline.
     while epochTime() < deadline:
       var allDelivered = true
+      var failedSlot = -1
+      var failedReason = ""
       withLock stateLock:
         for slot in 0 ..< config.tokens.len:
+          if state.slotErrors[slot].len > 0:
+            failedSlot = slot
+            failedReason = state.slotErrors[slot]
+            break
           if not state.promptSeen[slot]:
             allDelivered = false
+      if failedSlot >= 0:
+        failEpisode(failedSlot, failedReason)
       if allDelivered:
         break
       sleep(100)
 
+    var missingSlot = -1
+    var missingReason = ""
     withLock stateLock:
-      ## A seat that never delivered a prompt plays the expander baseline for
-      ## the whole episode: a seven-seat game must not stall on one late
-      ## container, and an empty prompt is not a policy.
       for slot in 0 ..< config.tokens.len:
-        if not state.promptSeen[slot] and state.scripted[slot] == skNone:
-          state.scripted[slot] = skExpander
-          echo "cogplomacy: slot ", slot,
-            " delivered no prompt; playing the expander baseline"
-      state.started = true
-      echo "cogplomacy: starting with ", state.playerSockets.len, "/",
-        config.tokens.len, " players connected"
-      state.broadcastLocked()
+        if state.slotErrors[slot].len > 0:
+          missingSlot = slot
+          missingReason = state.slotErrors[slot]
+          break
+        if not state.promptSeen[slot]:
+          missingSlot = slot
+          missingReason = "slot " & $slot & " did not deliver a prompt before connect timeout"
+          break
+      if missingSlot < 0:
+        state.started = true
+        echo "cogplomacy: starting with ", state.playerSockets.len, "/",
+          config.tokens.len, " players connected"
+        state.broadcastLocked()
+    if missingSlot >= 0:
+      failEpisode(missingSlot, missingReason)
 
     let client = newLlmClient(config)
 
@@ -330,29 +383,48 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var captureViews: seq[JsonNode]
       if not state.trajectory.isNil:
         for seat in seats: captureViews.add(simCopy.observationJson(seat))
-      let decisions = client.decideAll(state.selection, simCopy, seats, prompts, scripted)
+      var decisions: seq[Decision]
+      try:
+        decisions = client.decideAll(state.selection, simCopy, seats, prompts, scripted)
+      except DecisionFailure as error:
+        if not state.trajectory.isNil:
+          let pos = seats.find(error.seat)
+          let view = if pos >= 0 and pos < captureViews.len: captureViews[pos]
+            else: simCopy.observationJson(error.seat)
+          let attempts = if error.seat >= 0 and error.seat < client.nativeAttempts.len:
+            client.nativeAttempts[error.seat] else: @[]
+          state.trajectory.recordFailedDecision(simCopy.events.len, error.seat,
+            config.players[error.seat].name, view, attempts, state.selection, error.msg)
+        failEpisode(error.seat, error.msg)
 
+      var applyFailedSeat = -1
+      var applyFailedReason = ""
       withLock stateLock:
         for index, seat in seats:
-          let wasScripted = scripted[seat] != skNone or client.disabled or decisions[index].scripted
+          let wasScripted = scripted[seat] != skNone
           let eventIndex = state.sim.events.len
           try:
             applyDecision(state.sim, seat, decisions[index], wasScripted)
           except CatchableError as error:
-            echo "cogplomacy: reply rejected (", error.msg,
-              "); using scripted fallback"
-            try:
-              let fallback = scriptedDecision(state.sim, seat, skExpander)
-              applyDecision(state.sim, seat, fallback, true)
-            except CatchableError as inner:
-              echo "cogplomacy: scripted fallback failed: ", inner.msg
+            applyFailedSeat = seat
+            applyFailedReason = "reply rejected: " & error.msg
+            if not state.trajectory.isNil:
+              let attempts = if seat >= 0 and seat < client.nativeAttempts.len:
+                client.nativeAttempts[seat] else: @[]
+              state.trajectory.recordFailedDecision(eventIndex, seat,
+                config.players[seat].name, captureViews[index], attempts,
+                state.selection, applyFailedReason)
+            break
           if not state.trajectory.isNil:
             let applied = state.sim.events[eventIndex]
             state.trajectory.recordAppliedDecision(eventIndex, seat,
               config.players[seat].name, captureViews[index], applied.executedReply(),
               applied.scripted, scripted[seat] != skNone, client.nativeAttempts[seat],
               state.selection)
-        state.broadcastLocked()
+        if applyFailedSeat < 0:
+          state.broadcastLocked()
+      if applyFailedSeat >= 0:
+        failEpisode(applyFailedSeat, applyFailedReason)
 
       ## Pace between phases so spectators can read the board.
       if config.turnDelayMs > 0:
@@ -486,14 +558,11 @@ proc websocketHandler(
           let node = payload{"scripted"}
           let scripted =
             if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skExpander
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else:
+              raise newException(CogplomacyError, "scripted field must be a string")
           withLock stateLock:
             if state.started and not state.promptSeen[slot]:
-              ## Play began without this seat's prompt, so it is on the
-              ## expander baseline for the whole episode: a prompt arriving
-              ## now does not take the seat back.
               echo "cogplomacy: slot ", slot,
                 " delivered a prompt after play started; ignoring it"
             else:
@@ -505,7 +574,10 @@ proc websocketHandler(
                 (if scripted != skNone: ", scripted " & $scripted else: ""),
                 ")"
       except CatchableError as error:
-        echo "cogplomacy: ignoring bad player frame: ", error.msg
+        echo "cogplomacy: rejecting bad player frame from slot ", slot, ": ", error.msg
+        withLock stateLock:
+          if not state.promptSeen[slot] and state.slotErrors[slot].len == 0:
+            state.slotErrors[slot] = "slot " & $slot & " sent invalid registration frame: " & error.msg
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -579,6 +651,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   state.promptSeen = newSeq[bool](config.players.len)
+  state.slotErrors = newSeq[string](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

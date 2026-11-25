@@ -92,12 +92,6 @@ for game, maximum in (("standard", 196), ("gunboat", 210)):
                                 "text": f"SECRET-{power}",
                             }
                         ]
-                        action["letters"].append(
-                            {
-                                "to": action["letters"][0]["to"],
-                                "text": f"DROPPED-SECRET-{power}",
-                            }
-                        )
                     response = request(
                         process,
                         {

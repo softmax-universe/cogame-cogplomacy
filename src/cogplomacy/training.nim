@@ -60,18 +60,15 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: in
   var attempts = evidence
   var selected = none(string)
   var status = asAccepted
-  var fallback = none(string)
   if scripted:
+    doAssert declaredScripted, "non-scripted seat must never apply a scripted fallback"
     for attempt in attempts.mitems: attempt.accepted = false
-    if not declaredScripted:
-      status = asFallback
-      fallback = some("native-scripted-fallback")
     if attempts.len == 0:
       var attempt = newDecisionAttempt($eventIndex & "-" & $seat & "-unknown", policy, aoUnknown)
       attempt.parsedAction = applied
-      attempt.accepted = declaredScripted
+      attempt.accepted = true
       attempts.add(attempt)
-      if declaredScripted: selected = some(attempt.attemptId)
+      selected = some(attempt.attemptId)
   else:
     doAssert attempts.len > 0
     if attempts[^1].parsedAction != applied:
@@ -87,7 +84,37 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: in
         "prompt_template": promptMetadata(selection, attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
   trajectory.recordDecision("event-" & $eventIndex, $seat, view, attempts,
-    selected, applied, status, fallbackOrigin = fallback)
+    selected, applied, status)
+
+proc recordFailedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: int,
+    policy: string, observation: JsonNode, evidence: seq[DecisionAttempt],
+    selection: PromptSelection, reason: string) =
+  if trajectory.isNil: return
+  var attempts = evidence
+  for attempt in attempts.mitems:
+    attempt.accepted = false
+  if attempts.len == 0:
+    var attempt = newDecisionAttempt($eventIndex & "-" & $seat & "-failed", policy, aoModel)
+    attempt.rejectionReason = some(reason)
+    attempts.add(attempt)
+  var view = copy(observation)
+  view["prompt_attempts"] = newJArray()
+  for attempt in attempts:
+    if attempt.origin == aoModel and attempt.request.kind == JObject and
+        attempt.request.hasKey("system") and attempt.request.hasKey("messages") and
+        attempt.request["messages"].kind == JArray and attempt.request["messages"].len > 0:
+      view["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
+        "prompt_template": promptMetadata(selection, attempt.request["system"].getStr(),
+          attempt.request["messages"][0]["content"].getStr())})
+  trajectory.recordDecision("event-" & $eventIndex, $seat, view, attempts,
+    none(string), newJNull(), asRejected)
+
+proc finishFailedTrajectory*(trajectory: DecisionTrajectory, failedSeat: int,
+    reason: string) =
+  if trajectory.isNil: return
+  let outcome = %*{"failed_policy_index": failedSeat, "message": reason}
+  trajectory.finish(esFailed, outcome, newJObject())
+  trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
 proc finishNativeTrajectory*(trajectory: DecisionTrajectory, outcome: JsonNode) =
   if trajectory.isNil: return

@@ -6,7 +6,7 @@
 ## this seat's prompt to Claude once per phase, in one parallel batch with
 ## every other live seat.
 ##
-## PLAYER_SCRIPTED=expander (or 1) registers the seat as the built-in greedy
+## PLAYER_SCRIPTED=expander registers the seat as the built-in greedy
 ## baseline instead; PLAYER_SCRIPTED=hedgehog as the wall. The server plays
 ## those deterministically, no LLM.
 ##

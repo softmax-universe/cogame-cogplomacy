@@ -191,16 +191,25 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+game_host_args=()
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  game_host_args+=(--add-host=host.docker.internal:host-gateway)
+  echo "COWORLD_LLM_ENDPOINT present: the LLM sidecar path will be exercised"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  echo "no COWORLD_LLM_ENDPOINT or ANTHROPIC_API_KEY: only explicitly scripted seats can run"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  ${game_host_args[@]+"${game_host_args[@]}"} \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \

@@ -203,7 +203,35 @@ jobs:
         # scaffold-substituted default is only a fallback.
         env:
           SMOKE_SLUG: ${{ env.SLUG }}
-        run: ./tools/ci/docker_smoke.sh "${IMAGE}:ci"
+        run: |
+          set -euo pipefail
+          port_file="$(mktemp)"
+          log_file="$(mktemp)"
+          python3 tools/ci/mock_llm_server.py --host 0.0.0.0 --port 0 \
+            --port-file "${port_file}" --log-file "${log_file}" &
+          mock_pid=$!
+          trap 'kill "${mock_pid}" 2>/dev/null || true; rm -f "${port_file}" "${log_file}"' EXIT
+          for _ in $(seq 1 50); do
+            [ -s "${port_file}" ] && break
+            sleep 0.1
+          done
+          mock_port="$(cat "${port_file}")"
+          COWORLD_LLM_ENDPOINT="http://host.docker.internal:${mock_port}" \
+          COWORLD_LLM_MODEL="ci-deterministic-fixture" \
+            ./tools/ci/docker_smoke.sh "${IMAGE}:ci"
+          python3 - "${log_file}" dist/smoke/replay.json <<'PY'
+          import json, sys
+          calls = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+          assert calls, "mock LLM server received zero HTTP calls"
+          slots = {c["slot"] for c in calls}
+          assert slots == {"0"}, f"expected HTTP model calls only for slot 0, got {slots}"
+          replay = json.load(open(sys.argv[2]))
+          slot0 = [e for e in replay["events"] if e.get("seat") == 0 and e["kind"] in ("press", "orders", "retreat", "build")]
+          assert slot0 and all(not e.get("scripted", False) for e in slot0)
+          others = [e for e in replay["events"] if e.get("seat", -1) > 0 and e["kind"] in ("press", "orders", "retreat", "build")]
+          assert others and all(e.get("scripted", False) for e in others)
+          print(f"verified {len(calls)} HTTP model calls for slot 0 against 6 explicit baseline seats")
+          PY
 
       # The template smoke above checks what every game shares. This step
       # adds what THIS game's design note asks for: results.json validating
