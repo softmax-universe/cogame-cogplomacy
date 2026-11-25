@@ -384,3 +384,40 @@ suite "reply parsing":
       many.add(%"A PAR - BUR")
     expect CogplomacyError:
       discard sim.parseDecision(seat, %*{"orders": many})
+
+suite "hosted movement prompts":
+  test "London cannot support Norway and Naples cannot support Tunis":
+    var game = initSim(fixtureConfig(seed = 7, press = false))
+    # Keep London in place while Edinburgh moves to the North Sea.
+    for seat in game.pendingSeats():
+      var opening: seq[string]
+      for unit in game.unitsOf(game.powerOf[seat]):
+        opening.add(if unitLabel(unit) == "F EDI": "F EDI - NTH"
+          else: unitLabel(unit) & " H")
+      let decision = game.parseDecision(seat, %*{"orders": opening})
+      game.applyOrders(seat, decision.orders, "", false)
+    for (seat, illegal, legal) in [(1, "F LON S F NTH - NWY", "F LON S F NTH - ENG"),
+        (3, "F NAP S A ROM - TUN", "F NAP S A ROM - APU")]:
+      let prompt = game.userPrompt(seat, "")
+      let view = game.observationJson(seat)
+      check illegal notin prompt
+      check legal in prompt
+      let minimum = prompt.split("Minimum reply: ")[1].splitLines()[0]
+      var reply = parseJson(minimum)
+      discard game.parseDecision(seat, reply)
+      for unit in view["units"]:
+        for choice in unit["legalOrders"]:
+          check not parseOrder(game.board, game.powerOf[seat], choice.getStr()).illegal
+          check ("\n  " & choice.getStr() & "\n") in prompt
+      var sourceIndex = -1
+      for i, order in reply["orders"].elems:
+        if order.getStr().startsWith(illegal[0 .. 4]): sourceIndex = i
+      require sourceIndex >= 0
+      reply["orders"].elems[sourceIndex] = %legal
+      check legal in game.parseDecision(seat, reply).orders
+      reply["orders"].elems[sourceIndex] = %illegal
+      try:
+        discard game.parseDecision(seat, reply)
+        check false
+      except CogplomacyError as error:
+        check error.msg == "illegal order (nonadjacent): " & illegal

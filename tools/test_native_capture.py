@@ -26,12 +26,16 @@ class Provider(BaseHTTPRequestHandler):
         body = json.loads(raw)
         user = body["messages"][0]["content"]
         slot = self.headers["X-Coworld-Player-Slot"]
-        user = body["messages"][0]["content"]
         assert "PRIVATE_OPERATOR_" + slot in user
         assert all("PRIVATE_OPERATOR_" + str(i) not in user for i in range(7) if str(i) != slot)
         assert "SPECTATOR_POLICY_" not in user and "SPECTATOR_POLICY_" not in body["system"]
         self.server.calls.append((int(slot), body["model"]))
-        if self.server.force_reply is not None:
+        if getattr(self.server, "outage", False):
+            self.send_error(503, "provider unavailable")
+            return
+        if callable(self.server.force_reply):
+            text = self.server.force_reply(user)
+        elif self.server.force_reply is not None:
             text = self.server.force_reply
         else:
             text = self.server.fixture[(int(slot), body["system"], user)]
@@ -256,9 +260,16 @@ def run_model_vs_baselines(game, player, output, variant):
                 idx = 0
                 while idx < len(lines):
                     if lines[idx].startswith(("A ", "F ")) and " in " in lines[idx] and lines[idx].endswith(":"):
-                        orders.append(lines[idx + 1].strip())
+                        choices = []
+                        for line in lines[idx + 1:]:
+                            if not line.startswith("  "):
+                                break
+                            choices.append(line.strip())
+                        orders.append(next((choice for choice in choices if " - " in choice
+                                            and " VIA " not in choice), choices[0]))
                     idx += 1
                 assert orders, f"no legal orders found in prompt: {user[:400]}"
+                self.server.orders.append(orders)
                 reply = "```json\n" + json.dumps({"orders": orders, "notes": "HTTP_ORDERS"}) + "\n```"
             elif "— RETREATS." in user:
                 retreats = []
@@ -303,6 +314,7 @@ def run_model_vs_baselines(game, player, output, variant):
         env.pop(key, None)
     provider = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
     provider.calls = []
+    provider.orders = []
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     env.update(
@@ -354,6 +366,12 @@ def run_model_vs_baselines(game, player, output, variant):
         assert len(slot0_events) >= 4
         assert all(not e.get("scripted", False) for e in slot0_events)
         assert any(e["kind"] == "press" and e.get("broadcast") == "HTTP_MODEL_BROADCAST" for e in slot0_events)
+        submitted = [e["orders"] for e in slot0_events if e["kind"] == "orders"]
+        assert submitted == provider.orders and any(" - " in o for orders in submitted for o in orders)
+        rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
+        accepted = [row for row in rows[:-1] if row["seat"] == "0" and row["observation"]["phase"] == "orders"]
+        assert [row["executed_action"]["orders"] for row in accepted] == submitted
+        assert all(row["action_status"] == "accepted" and row["selected_attempt_id"] for row in accepted)
         baseline_events = [e for e in replay["events"] if e.get("seat", -1) > 0 and e["kind"] in ("press", "orders", "retreat", "build")]
         assert baseline_events and all(e.get("scripted", False) for e in baseline_events)
     finally:
@@ -368,14 +386,15 @@ def run_model_vs_baselines(game, player, output, variant):
             stream.close()
 
 
-def run_expected_failure(game, player, output, variant, name, model_enabled, force_reply=None):
+def run_expected_failure(game, player, output, variant, name, model_enabled, force_reply=None,
+                         model_seat=0, illegal=None, outage=False):
     """Verify missing credentials or persistent bad model replies fail explicitly without scripted fallback."""
     root = output / f"fail-{name}"
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
     seats = 7
     config.update(
-        seed=42,
+        seed=7,
         years=1,
         press=False,
         turnDelayMs=0,
@@ -404,6 +423,7 @@ def run_expected_failure(game, player, output, variant, name, model_enabled, for
     if model_enabled:
         provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
         provider.calls = []
+        provider.outage = outage
         provider.force_reply = force_reply
         provider.fixture = {}
         thread = threading.Thread(target=provider.serve_forever, daemon=True)
@@ -441,8 +461,8 @@ def run_expected_failure(game, player, output, variant, name, model_enabled, for
             streams.append(log)
             player_env = dict(env, COWORLD_TIMEOUT_SECONDS="600")
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fail-{seat}"
-            if seat == 0:
-                player_env["PLAYER_PROMPT"] = "PRIVATE_OPERATOR_0"
+            if seat == model_seat:
+                player_env["PLAYER_PROMPT"] = f"PRIVATE_OPERATOR_{seat}"
                 player_env.pop("PLAYER_SCRIPTED", None)
             else:
                 player_env["PLAYER_SCRIPTED"] = "expander"
@@ -452,18 +472,27 @@ def run_expected_failure(game, player, output, variant, name, model_enabled, for
         assert not (root / "results.json").exists(), "results.json must not be written on player failure"
         assert not (root / "replay.json").exists(), "replay.json must not be written on player failure"
         failure = json.loads((root / "player_failure.json").read_text())
-        assert set(failure) == {"message", "failed_policy_index"}
-        assert failure["failed_policy_index"] == 0
+        assert set(failure) == {"message", "failed_policy_index", "kind"}
+        assert failure["failed_policy_index"] == model_seat
+        assert failure["kind"] == ("episode_inconclusive" if outage or not model_enabled else "player_error")
+        if illegal:
+            assert f"illegal order (nonadjacent): {illegal}" in failure["message"]
         assert failure["message"]
         rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
         assert rows[-1]["status"] == "failed"
-        assert rows[0]["action_status"] == "rejected"
-        assert rows[0]["selected_attempt_id"] is None
-        if force_reply is not None:
-            assert len(rows[0]["attempts"]) == 2
-            for attempt in rows[0]["attempts"]:
-                assert attempt["response"] == force_reply
-                assert json.loads(attempt["raw_response"])["content"][0]["text"] == force_reply
+        assert rows[-1]["outcome"] == failure and not rows[-1]["participant_outcomes"]
+        rejected = rows[-2]
+        assert rejected["executed_action"] is None
+        assert rejected["action_status"] == "rejected"
+        assert rejected["selected_attempt_id"] is None
+        if model_enabled:
+            assert len(rejected["attempts"]) == 2
+            for attempt in rejected["attempts"]:
+                if illegal:
+                    assert illegal in json.loads(attempt["response"])["orders"]
+                    assert illegal not in attempt["request"]["messages"][0]["content"].split("Your previous reply")[0]
+                if outage:
+                    assert "503" in attempt["rejection_reason"]
                 assert attempt["rejection_reason"] is not None
     finally:
         if provider is not None:
@@ -494,15 +523,19 @@ def main():
             assert captured.result() == ordinary.result(), "capture changed the native outcome or replay"
     run_model_vs_baselines(game, player, destination, manifest["variants"][0])
     run_expected_failure(game, player, destination, manifest["variants"][0], "no-credentials", model_enabled=False)
-    run_expected_failure(
-        game,
-        player,
-        destination,
-        manifest["variants"][0],
-        "illegal-order",
-        model_enabled=True,
-        force_reply='{"orders": ["A NOT_A_PROVINCE - NOPE"]}',
-    )
+    run_expected_failure(game, player, destination, manifest["variants"][0], "unavailable",
+                         model_enabled=True, outage=True)
+    for seat, illegal in [(1, "F LON S F NTH - NWY"), (3, "F NAP S A ROM - TUN")]:
+        def propose(user):
+            orders = json.loads(user.split("Minimum reply: ")[1].splitlines()[0])["orders"]
+            if seat == 1 and user.startswith("SPRING 1901"):
+                orders[orders.index("F EDI H")] = "F EDI - NTH"
+            else:
+                orders[orders.index(illegal[:5] + " H")] = illegal
+            return json.dumps({"orders": orders})
+
+        run_expected_failure(game, player, destination, manifest["variants"][0], f"support-{seat}",
+                             model_enabled=True, model_seat=seat, force_reply=propose, illegal=illegal)
     print(
         "native capture parity, model-vs-baselines HTTP verification, markdown fence, "
         "and explicit failure without scripted fallback all pass"
