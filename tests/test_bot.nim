@@ -325,6 +325,9 @@ suite "reply parsing":
     var sim = initSim(fixtureConfig(years = 1))
     let seat = sim.pendingSeats()[0]
     let otherPower = PowerNames[(sim.powerOf[seat] + 1) mod Powers]
+    let press = sim.userPrompt(seat, "")
+    for place in ["Holland=HOL", "Vienna=VIE", "Trieste=TRI"]:
+      check place in press
     expect CogplomacyError:
       discard sim.parseDecision(seat, %*{
         "broadcast": "hello",
