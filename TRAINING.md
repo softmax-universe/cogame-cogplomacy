@@ -3,12 +3,13 @@
 ## Authentic native model capture
 
 Set `COGAME_SAVE_TRAJECTORY_URI` on the ordinary server to retain private native
-requests, received responses, platform call IDs, applied actions and all retry,
-fallback and normalization evidence. All seven private views are frozen before
+requests, received responses, platform call IDs, applied actions and all retry
+and rejection evidence. All seven private views are frozen before
 any submission in each press/orders/retreats/builds phase. The native simultaneous
 batches, parser, complete horizon and game rules stay unchanged. Failed model
-decisions now stamp their actual scripted fallback provenance in the replay;
-their actions and outcomes stay the same with capture enabled or disabled.
+decisions never fall back to scripted baselines: they fail the episode explicitly
+via `COGAME_PLAYER_FAILURE_URI` while preserving the raw submitted attempts in
+the trajectory.
 
 Only unchanged selected model replies can become targets. Optional omitted
 JSON fields receive native empty defaults for equality checks only; parser or

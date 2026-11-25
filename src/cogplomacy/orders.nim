@@ -11,12 +11,10 @@
 ##   BUILD F STP/SC          winter adjustment
 ##   DISBAND A MOS           winter adjustment
 ##
-## Parsing is whitespace- and case-tolerant and accepts `-`, `–` and `->`
-## for a move and `S`/`SUPPORT`, `C`/`CONVOY`, `H`/`HOLD`/`HOLDS`; nothing
-## else. An order that cannot be parsed, or that names something the map
-## forbids, comes back with `illegal = true` and a one-word `why`; the sim
-## turns every such order into a hold and records it. An illegal order NEVER
-## invalidates the rest of a reply.
+## Parsing is whitespace- and case-tolerant and accepts only the canonical
+## grammar above (`A`/`F`, `H`, `-`, `VIA CONVOY`, `S`, `C`, `- D`, `BUILD`,
+## `DISBAND`). An order that cannot be parsed, or that names something the map
+## forbids, comes back with `illegal = true` and a one-word `why`.
 
 import std/[algorithm, strutils], mapdata, types
 
@@ -127,11 +125,7 @@ proc convoyPossible*(fromProv, toProv: int): bool =
 # ---- Parsing ----------------------------------------------------------------
 
 proc normalize(raw: string): seq[string] =
-  var text = raw.strip().toUpperAscii()
-  text = text.replace("\u2013", "-").replace("\u2014", "-")
-  text = text.replace("->", "-").replace("=>", "-")
-  text = text.replace(".", " ").replace(",", " ")
-  text = text.replace("-", " - ")
+  let text = raw.strip().toUpperAscii()
   for token in text.splitWhitespace():
     if token.len > 0:
       result.add(token)
@@ -154,19 +148,16 @@ proc badOrder(power: int, raw, why: string): Order =
     target: -1, auxFrom: -1, auxTo: -1, raw: raw, illegal: true, why: why)
 
 proc isUnitToken(token: string): bool =
-  token in ["A", "F", "ARMY", "FLEET"]
+  token in ["A", "F"]
 
 proc namedUnit(board: Board, power: int, raw: string): int =
   ## Index of the power's unit an order names, or -1. Read off the head of
   ## the order alone, so an order that is illegal further along still says
   ## which unit it was for.
   let tokens = normalize(raw)
-  var index = 0
-  if tokens.len > 0 and isUnitToken(tokens[0]):
-    index = 1
-  if index >= tokens.len:
+  if tokens.len < 2 or not isUnitToken(tokens[0]):
     return -1
-  let origin = parseLoc(tokens[index])
+  let origin = parseLoc(tokens[1])
   if origin.province < 0:
     return -1
   let seat = board.unitAt(origin.province)
@@ -176,15 +167,11 @@ proc namedUnit(board: Board, power: int, raw: string): int =
 
 proc parseOrderBody(board: Board, power: int, raw: string): Order =
   let tokens = normalize(raw)
-  if tokens.len == 0:
+  if tokens.len < 3 or not isUnitToken(tokens[0]):
     return badOrder(power, raw, "parse")
-  var index = 0
-  if isUnitToken(tokens[index]):
-    inc index
-  if index >= tokens.len:
-    return badOrder(power, raw, "parse")
-  let origin = parseLoc(tokens[index])
-  inc index
+  let unitToken = tokens[0]
+  let origin = parseLoc(tokens[1])
+  var index = 2
   if origin.province < 0:
     return badOrder(power, raw, "parse")
   let seat = board.unitAt(origin.province)
@@ -193,16 +180,20 @@ proc parseOrderBody(board: Board, power: int, raw: string): Order =
   let unit = board.units[seat]
   if unit.power != power:
     return badOrder(power, raw, "wrongunit")
+  if $unit.kind != unitToken:
+    return badOrder(power, raw, "wrongunit")
+  if origin.coast.len > 0 and origin.coast != unit.coast:
+    return badOrder(power, raw, "wrongunit")
 
   var order = Order(power: power, unit: unit, kind: okHold, target: -1,
     auxFrom: -1, auxTo: -1, raw: raw)
 
-  if index >= tokens.len:
-    return order
   let verb = tokens[index]
   inc index
 
-  if verb in ["H", "HOLD", "HOLDS"]:
+  if verb == "H":
+    if index != tokens.len:
+      return badOrder(power, raw, "parse")
     return order
 
   if verb == "-":
@@ -213,19 +204,20 @@ proc parseOrderBody(board: Board, power: int, raw: string): Order =
     if dest.province < 0:
       return badOrder(power, raw, "parse")
     var via = false
-    while index < tokens.len:
-      if tokens[index] == "VIA":
+    if index < tokens.len:
+      if index + 2 == tokens.len and tokens[index] == "VIA" and
+          tokens[index + 1] == "CONVOY":
         via = true
-      elif tokens[index] != "CONVOY":
+        index += 2
+      else:
         return badOrder(power, raw, "parse")
-      inc index
     if dest.province == unit.province:
       return badOrder(power, raw, "parse")
     order.kind = okMove
     order.target = dest.province
     order.viaConvoy = via
     if unit.kind == ukArmy:
-      if not armyCanEnter(dest.province):
+      if dest.coast.len > 0 or not armyCanEnter(dest.province):
         return badOrder(power, raw, "wrongunit")
       order.targetCoast = ""
       if via and not convoyPossible(unit.province, dest.province):
@@ -256,11 +248,11 @@ proc parseOrderBody(board: Board, power: int, raw: string): Order =
     order.targetCoast = FleetNodeCoast[reach[0]]
     return order
 
-  if verb in ["S", "SUPPORT", "SUPPORTS"]:
-    if index < tokens.len and isUnitToken(tokens[index]):
-      inc index
-    if index >= tokens.len:
+  if verb == "S":
+    if index + 1 >= tokens.len or not isUnitToken(tokens[index]):
       return badOrder(power, raw, "parse")
+    let auxUnitToken = tokens[index]
+    inc index
     let aux = parseLoc(tokens[index])
     inc index
     if aux.province < 0:
@@ -270,6 +262,8 @@ proc parseOrderBody(board: Board, power: int, raw: string): Order =
     let auxSeat = board.unitAt(aux.province)
     if auxSeat < 0:
       return badOrder(power, raw, "notthere")
+    if $board.units[auxSeat].kind != auxUnitToken:
+      return badOrder(power, raw, "wrongunit")
     order.auxFrom = aux.province
     order.auxKind = board.units[auxSeat].kind
     if index >= tokens.len:
@@ -297,15 +291,15 @@ proc parseOrderBody(board: Board, power: int, raw: string): Order =
       return badOrder(power, raw, "nonadjacent")
     return order
 
-  if verb in ["C", "CONVOY", "CONVOYS"]:
+  if verb == "C":
     if unit.kind != ukFleet:
       return badOrder(power, raw, "wrongunit")
     if not isSea(unit.province):
       return badOrder(power, raw, "wrongunit")
-    if index < tokens.len and isUnitToken(tokens[index]):
-      inc index
-    if index >= tokens.len:
+    if index + 1 >= tokens.len or not isUnitToken(tokens[index]):
       return badOrder(power, raw, "parse")
+    let auxUnitToken = tokens[index]
+    inc index
     let aux = parseLoc(tokens[index])
     inc index
     if aux.province < 0:
@@ -313,7 +307,7 @@ proc parseOrderBody(board: Board, power: int, raw: string): Order =
     let auxSeat = board.unitAt(aux.province)
     if auxSeat < 0:
       return badOrder(power, raw, "notthere")
-    if board.units[auxSeat].kind != ukArmy:
+    if board.units[auxSeat].kind != ukArmy or auxUnitToken != "A":
       return badOrder(power, raw, "wrongunit")
     if index >= tokens.len or tokens[index] != "-":
       return badOrder(power, raw, "parse")
@@ -507,18 +501,12 @@ proc legalRetreats*(board: Board, unit: Unit, attackerFrom: int,
 
 proc parseRetreat*(board: Board, power: int, raw: string,
     dislodged: seq[Dislodgement], standoffs: seq[int]): RetreatOrder =
-  ## A missing, unparsable or illegal retreat is a disband — never an error.
+  ## Canonical retreat notation: `A VIE - TYR` or `A VIE - D`.
   result = RetreatOrder(to: -1, ok: false, why: "parse")
   let tokens = normalize(raw)
-  if tokens.len == 0:
+  if tokens.len != 4 or not isUnitToken(tokens[0]) or tokens[2] != "-":
     return
-  var index = 0
-  if isUnitToken(tokens[index]):
-    inc index
-  if index >= tokens.len:
-    return
-  let origin = parseLoc(tokens[index])
-  inc index
+  let origin = parseLoc(tokens[1])
   if origin.province < 0:
     return
   var unit: Unit
@@ -530,21 +518,15 @@ proc parseRetreat*(board: Board, power: int, raw: string,
   if not found:
     result.why = "notthere"
     return
+  if $unit.kind != tokens[0] or (origin.coast.len > 0 and origin.coast != unit.coast):
+    result.why = "wrongunit"
+    return
   result.unit = unit
-  if index >= tokens.len:
+  if tokens[3] == "D":
     result.ok = true
     result.why = ""
     return
-  if tokens[index] != "-":
-    return
-  inc index
-  if index >= tokens.len:
-    return
-  if tokens[index] in ["D", "DISBAND"]:
-    result.ok = true
-    result.why = ""
-    return
-  let dest = parseLoc(tokens[index])
+  let dest = parseLoc(tokens[3])
   if dest.province < 0:
     return
   var attackerFrom = -1
@@ -597,31 +579,20 @@ proc legalDisbands*(board: Board, power: int): seq[string] =
       result.add("DISBAND " & unitLabel(unit))
 
 proc parseAdjustment*(board: Board, power: int, raw: string): AdjustOrder =
-  ## `BUILD A PAR` / `DISBAND F BRE`. Illegal adjustments are waived (builds)
-  ## or replaced by civil disorder (disbands) upstream.
+  ## Canonical winter adjustments: `BUILD A PAR` / `DISBAND F BRE`.
   result = AdjustOrder(ok: false, why: "parse")
   let tokens = normalize(raw)
-  if tokens.len < 2:
+  if tokens.len != 3 or not isUnitToken(tokens[1]):
     return
-  var index = 0
   var isBuild = true
-  if tokens[0] in ["BUILD", "B"]:
+  if tokens[0] == "BUILD":
     isBuild = true
-    index = 1
-  elif tokens[0] in ["DISBAND", "REMOVE", "D"]:
+  elif tokens[0] == "DISBAND":
     isBuild = false
-    index = 1
   else:
     return
-  if index >= tokens.len:
-    return
-  var kind = ukArmy
-  if isUnitToken(tokens[index]):
-    kind = if tokens[index] in ["F", "FLEET"]: ukFleet else: ukArmy
-    inc index
-  if index >= tokens.len:
-    return
-  let loc = parseLoc(tokens[index])
+  let kind = if tokens[1] == "F": ukFleet else: ukArmy
+  let loc = parseLoc(tokens[2])
   if loc.province < 0:
     return
   result.build = isBuild
@@ -641,6 +612,10 @@ proc parseAdjustment*(board: Board, power: int, raw: string): AdjustOrder =
   let seat = board.unitAt(loc.province)
   if seat < 0 or board.units[seat].power != power:
     result.why = "notthere"
+    return
+  if board.units[seat].kind != kind or
+      (loc.coast.len > 0 and loc.coast != board.units[seat].coast):
+    result.why = "wrongunit"
     return
   result.unit = board.units[seat]
   result.ok = true

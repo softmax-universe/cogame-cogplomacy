@@ -1,11 +1,12 @@
 import cogplomacy/prompts
-import std/[json, strutils, unicode, unittest]
+import std/[json, os, strutils, unicode, unittest]
 import cogplomacy/llm
 import ../tools/tune_baselines
 
-## The scripted baselines: bounded, always legal, and the load-bearing
-## offline fallback. Reply parsing is exercised here too, because a reply
-## that fails to parse is answered by these bots.
+## The scripted baselines: bounded, always legal, and explicitly selected via
+## PLAYER_SCRIPTED. Reply parsing is exercised here too: invalid replies and
+## non-canonical aliases are rejected rather than silently repaired or fallen
+## back to scripted decisions.
 
 proc fixtureConfig(years = 4, seed = 0, press = true): GameConfig =
   result = defaultGameConfig()
@@ -253,70 +254,105 @@ suite "baseline tuning":
         check cell.centres > cell.hedgehog
     check shipped >= 0
 
-suite "offline fallback":
-  test "decideAll with no credentials answers every seat without a network":
+suite "no implicit offline fallback":
+  test "decideAll without credentials fails model seats explicitly and still runs scripted seats":
+    for key in ["COWORLD_LLM_ENDPOINT", "COWORLD_LLM_MODEL", "ANTHROPIC_API_KEY",
+        "ANTHROPIC_API_KEY_URI", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "AWS_BEARER_TOKEN_BEDROCK"]:
+      delEnv(key)
     let config = fixtureConfig(years = 2)
     var sim = initSim(config)
     let client = newLlmClient(config)
-    check client.disabled          # CI has no credentials
-    var prompts = newSeq[string](Seats)
-    var kinds = newSeq[ScriptKind](Seats)
+    check client.disabled
+    let prompts = newSeq[string](Seats)
     let seats = sim.pendingSeats()
-    let decisions = client.decideAll(PromptSelection(), sim, seats, prompts, kinds)
-    check decisions.len == Seats
-    ## Every one of them is a legal, applyable decision.
-    for index, seat in seats:
-      sim.applyPress(seat, decisions[index].broadcast,
-        decisions[index].letters, decisions[index].pledges,
-        decisions[index].notes, true)
-    check sim.phase == pkOrders
+    ## Explicit scripted seats complete without credentials.
+    let scriptedDecisions = client.decideAll(PromptSelection(), sim, seats,
+      prompts, allOf(skExpander))
+    check scriptedDecisions.len == Seats
+    ## Non-scripted model seats fail explicitly instead of falling back.
+    let modelKinds = newSeq[ScriptKind](Seats)
+    expect DecisionFailure:
+      discard client.decideAll(PromptSelection(), sim, seats, prompts, modelKinds)
 
 suite "reply parsing":
-  test "PLAYER_SCRIPTED values map to the two baselines":
+  test "PLAYER_SCRIPTED accepts only canonical values":
     check parseScriptKind("expander") == skExpander
-    check parseScriptKind("1") == skExpander
-    check parseScriptKind(" TRUE ") == skExpander
+    check parseScriptKind(" EXPANDER ") == skExpander
     check parseScriptKind("hedgehog") == skHedgehog
-    check parseScriptKind("turtle") == skHedgehog
     check parseScriptKind("") == skNone
-    check parseScriptKind("nonsense") == skNone
+    for bad in ["1", "true", "yes", "greedy", "turtle", "wall", "nonsense"]:
+      expect CogplomacyError:
+        discard parseScriptKind(bad)
 
-  test "fenced and prose-wrapped JSON is extracted":
+  test "raw JSON and standard outer markdown JSON fence are accepted; prose is rejected":
+    let raw = "{\"orders\":[\"A PAR - BUR\"]}"
+    check extractJsonObject(raw){"orders"}.len == 1
     let fenced = "```json\n{\"orders\":[\"A PAR - BUR\"]}\n```"
     check extractJsonObject(fenced){"orders"}.len == 1
+    let plainFenced = "```\n{\"orders\":[\"A PAR - BUR\"]}\n```"
+    check extractJsonObject(plainFenced){"orders"}.len == 1
     let prose = "Here is my move.\n{\"orders\": [\"A PAR - BUR\"]}\nGood luck!"
-    check extractJsonObject(prose){"orders"}.len == 1
+    expect CogplomacyError:
+      discard extractJsonObject(prose)
     expect CogplomacyError:
       discard extractJsonObject("no json at all here")
 
-  test "a missing required key is invalid; bad contents are repaired":
+  test "invalid, illegal, or incomplete orders are rejected":
     var sim = initSim(fixtureConfig(years = 1, press = false))
-    let seat = sim.pendingSeats()[0]
+    let seat = sim.seatOf[2] # France: A PAR, A MAR, F BRE
     expect CogplomacyError:
       discard sim.parseDecision(seat, parseJson("""{"notes":"hi"}"""))
     expect CogplomacyError:
       discard sim.parseDecision(seat, parseJson("""{"orders":"A PAR - BUR"}"""))
-    ## An oversize order string survives parsing and becomes a hold later.
-    let long = "A PAR - " & "X".repeat(80)
+    ## Missing units are rejected instead of synthesized as holds.
+    expect CogplomacyError:
+      discard sim.parseDecision(seat, %*{"orders": ["A PAR - BUR"]})
+    ## Illegal orders are rejected instead of repaired to holds.
+    expect CogplomacyError:
+      discard sim.parseDecision(seat,
+        %*{"orders": ["A PAR - ENG", "A MAR H", "F BRE H"]})
+    ## Redundant notation aliases are rejected.
+    expect CogplomacyError:
+      discard sim.parseDecision(seat,
+        %*{"orders": ["A PAR -> BUR", "A MAR HOLD", "F BRE H"]})
+    ## Canonical complete order set is accepted.
     let decision = sim.parseDecision(seat,
-      %*{"orders": [long, "A PAR - BUR"]})
-    check decision.orders.len == 2
-    check decision.orders[0].runeLen <= MaxOrderLen
+      %*{"orders": ["A PAR - BUR", "A MAR H", "F BRE H"]})
+    check decision.orders == @["A PAR - BUR", "A MAR H", "F BRE H"]
 
-  test "an unknown pledge kind or recipient is dropped, not rejected":
+  test "unknown pledge kind, alias, or unknown recipient is rejected":
     var sim = initSim(fixtureConfig(years = 1))
     let seat = sim.pendingSeats()[0]
+    let otherPower = PowerNames[(sim.powerOf[seat] + 1) mod Powers]
+    expect CogplomacyError:
+      discard sim.parseDecision(seat, %*{
+        "broadcast": "hello",
+        "letters": [{"to": "ATLANTIS", "text": "hi"}]
+      })
+    expect CogplomacyError:
+      discard sim.parseDecision(seat, %*{
+        "broadcast": "hello",
+        "pledges": [{"to": otherPower, "kind": "invade"}]
+      })
+    expect CogplomacyError:
+      discard sim.parseDecision(seat, %*{
+        "broadcast": "hello",
+        "pledges": [{"to": "ALL", "kind": "keep-out", "province": "BUR"}]
+      })
+    expect CogplomacyError:
+      discard sim.parseDecision(seat, %*{
+        "broadcast": "hello",
+        "pledges": [{"to": "ALL", "kind": "keepout", "province": "ZZZ"}]
+      })
     let decision = sim.parseDecision(seat, %*{
       "broadcast": "hello",
-      "letters": [{"to": "ATLANTIS", "text": "hi"},
-                  {"to": "ITALY", "text": "real"}],
-      "pledges": [{"to": "ITALY", "kind": "invade"},
-                  {"to": "ITALY", "kind": "peace"},
-                  {"to": "ALL", "kind": "keepout", "province": "ZZZ"},
+      "letters": [{"to": otherPower, "text": "real"}],
+      "pledges": [{"to": otherPower, "kind": "peace"},
                   {"to": "ALL", "kind": "keepout", "province": "BUR"}]
     })
     check decision.broadcast == "hello"
-    check decision.letters.len <= 1
+    check decision.letters.len == 1
     check decision.pledges.len == 2
     check decision.pledges[0].kind == plPeace
     check decision.pledges[1].kind == plKeepOut
@@ -334,18 +370,17 @@ suite "reply parsing":
     let seat = sim.pendingSeats()[0]
     let decision = sim.parseDecision(seat, %*{
       "broadcast": "hello",
-      "letters": [{"to": "all", "text": "everybody hears this"},
-                  {"to": "ATLANTIS", "text": "nobody hears this"}]
+      "letters": [{"to": "all", "text": "everybody hears this"}]
     })
     check decision.letters.len == 1
     check decision.letters[0].toPower < 0
     check decision.letters[0].text == "everybody hears this"
 
-  test "an over-long array is truncated from the end":
+  test "an over-long array is rejected":
     var sim = initSim(fixtureConfig(years = 1, press = false))
     let seat = sim.pendingSeats()[0]
     var many = newJArray()
     for index in 0 ..< 80:
       many.add(%"A PAR - BUR")
-    let decision = sim.parseDecision(seat, %*{"orders": many})
-    check decision.orders.len == MaxOrdersPerReply
+    expect CogplomacyError:
+      discard sim.parseDecision(seat, %*{"orders": many})

@@ -6,17 +6,18 @@
 ##
 ## All seven powers decide SIMULTANEOUSLY by rule, so every phase fires its
 ## requests as ONE parallel batch (`curly.makeRequests`) — never seat by
-## seat. An invalid reply joins one retry batch carrying a hint; anything
-## still failing is answered by the `expander` baseline.
+## seat. An invalid reply joins one retry batch carrying the rejection reason;
+## if a model seat still fails, the episode fails explicitly rather than
+## substituting a scripted fallback.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
-##   ANTHROPIC_API_KEY                - the key itself
-##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing.
+##   ANTHROPIC_API_KEY               - the key itself
+##   ANTHROPIC_API_KEY_URI           - a URI holding the key
+## Explicit scripted seats (`PLAYER_SCRIPTED=expander` or `hedgehog`) run
+## deterministically without an LLM; non-scripted seats require a configured
+## LLM endpoint/credential.
 
 import
   std/[algorithm, json, options, os, strutils, times, unicode],
@@ -35,6 +36,9 @@ const
   Far = high(int) div 4
 
 type
+  DecisionFailure* = object of CogplomacyError
+    seat*: int
+
   ScriptKind* = enum
     skNone = "none"
     skExpander = "expander"
@@ -69,12 +73,15 @@ type
     nativeAttempts*: seq[seq[DecisionAttempt]]
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "expander"/"1"/"true"/"yes" play the greedy
-  ## expander, "hedgehog"/"turtle" the wall, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "expander", "greedy": skExpander
-  of "hedgehog", "turtle", "wall": skHedgehog
-  else: skNone
+  ## Canonical PLAYER_SCRIPTED values: "" (LLM-driven), "expander", "hedgehog".
+  let cleaned = text.strip().toLowerAscii()
+  case cleaned
+  of "": skNone
+  of "expander": skExpander
+  of "hedgehog": skHedgehog
+  else:
+    raise newException(CogplomacyError,
+      "unknown PLAYER_SCRIPTED value: " & cleanText(oneLine(text), 64))
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -155,7 +162,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "cogplomacy llm: no LLM credentials; using scripted fallback"
+    echo "cogplomacy llm: no LLM credentials configured (scripted seats only)"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -387,8 +394,17 @@ proc scriptedRetreats(sim: Sim, power: int, kind: ScriptKind): seq[string] =
 
 proc scriptedBuilds(sim: Sim, power: int, kind: ScriptKind): seq[string] =
   let delta = sim.centresOfPower(power) - sim.unitCount(power)
-  if delta <= 0:
-    ## Disbands are left to the civil-disorder rule.
+  if delta == 0:
+    return
+  if delta < 0:
+    let owed = -delta
+    var removed: seq[int]
+    while removed.len < owed:
+      let index = sim.civilDisorderPick(power, removed)
+      if index < 0:
+        break
+      removed.add(sim.board.units[index].province)
+      result.add("DISBAND " & unitLabel(sim.board.units[index]))
     return
   var fleets = 0
   var armies = 0
@@ -465,9 +481,9 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
       others.add(PowerNames[other])
   let othersText = others[0 ..< others.high].join(", ") & " and " & others[^1]
   selection.introduction(PowerNames[power], othersText) & """
-""" & selection.rulesBriefing() & """OUTPUT FORMAT: reply with ONLY one JSON object, nothing else — no
-analysis, no explanation, no markdown fences, no text before or after the
-object. Your reply must begin with the character { and end with }."""
+""" & selection.rulesBriefing() & """OUTPUT FORMAT: reply with ONLY one JSON object (a standard outer ```json ... ```
+fence is also accepted), nothing else — no analysis, no explanation, and no text
+before or after the object."""
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -598,129 +614,229 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   of pkOrders:
     result.add(sim.legalOrdersBlock(power))
     result.add("Reply with ONLY {\"orders\":[\"A PAR - BUR\"," &
-      "\"F BRE S A PAR - BUR\"],\"notes\":\"…\"} — exactly one order per " &
-      "unit, copied character for character from the list above. An order " &
-      "that is not on the list becomes a hold.")
+      "\"F BRE S A PAR - BUR\"],\"notes\":\"…\"} — exactly one legal order per " &
+      "unit, copied from the list above.")
   of pkRetreats:
     result.add(sim.retreatBlock(power))
     result.add("Reply with ONLY {\"retreats\":[\"A VIE - TYR\"]," &
-      "\"notes\":\"…\"} — one entry per dislodged unit; " &
+      "\"notes\":\"…\"} — exactly one legal entry per dislodged unit; " &
       "\"A VIE - D\" disbands it.")
   of pkBuilds:
     result.add(sim.buildBlock(power))
     result.add("Reply with ONLY {\"adjustments\":[\"BUILD A PAR\"]," &
-      "\"notes\":\"…\"} (or \"DISBAND F BRE\" when you must remove units).")
+      "\"notes\":\"…\"} (or \"DISBAND F BRE\" when you must remove units; " &
+      "use [] only when waiving builds or when no build sites are available).")
   of pkDone:
     discard
 
 # ---- Reply parsing ----------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Rune-cut, never byte-cut: a slice through a multi-byte character
-    ## would put invalid UTF-8 into the error text.
-    raise newException(CogplomacyError, "no JSON object in response: " &
+  ## Parses a JSON object, accepting either raw JSON or a single standard
+  ## outer Markdown JSON fence (` ```json ... ``` ` or ` ``` ... ``` `).
+  ## Surrounding prose is rejected.
+  var body = text.strip()
+  if body.startsWith("```"):
+    let firstNl = body.find('\n')
+    if firstNl < 0:
+      raise newException(CogplomacyError, "malformed markdown fence in response: " &
+        cleanText(oneLine(text), 160))
+    let header = body[3 ..< firstNl].strip().toLowerAscii()
+    if header.len > 0 and header != "json":
+      raise newException(CogplomacyError, "unsupported markdown fence language: " &
+        cleanText(oneLine(header), 32))
+    let afterHeader = body[firstNl + 1 .. ^1]
+    if not afterHeader.endsWith("```"):
+      raise newException(CogplomacyError, "unclosed markdown fence in response: " &
+        cleanText(oneLine(text), 160))
+    let inner = afterHeader[0 ..< afterHeader.len - 3]
+    if inner.len > 0 and inner[^1] notin {'\n', '\r'}:
+      raise newException(CogplomacyError, "malformed closing markdown fence in response: " &
+        cleanText(oneLine(text), 160))
+    body = inner.strip()
+  if body.len < 2 or body[0] != '{' or body[^1] != '}':
+    raise newException(CogplomacyError, "expected JSON object in response: " &
       cleanText(oneLine(text), 160))
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(body)
+  except CatchableError as error:
+    raise newException(CogplomacyError, "invalid JSON in response: " & error.msg)
+  if result.kind != JObject:
+    raise newException(CogplomacyError, "reply is not a JSON object")
 
-proc stringList(node: JsonNode, limit: int): seq[string] =
+proc parseNotesField(payload: JsonNode): string =
+  let node = payload{"notes"}
+  if node.isNil:
+    return ""
+  if node.kind != JString:
+    raise newException(CogplomacyError, "notes must be a string")
+  cleanText(node.getStr(), MaxNotesLen)
+
+proc strictStringList(node: JsonNode, fieldName: string, limit: int): seq[string] =
   if node.isNil or node.kind != JArray:
-    return
+    raise newException(CogplomacyError, "no " & fieldName & " array in reply")
+  if node.len > limit:
+    raise newException(CogplomacyError, fieldName & " exceeds limit of " & $limit)
   for item in node:
-    if result.len >= limit:
-      break
-    if item.kind == JString:
-      result.add(cleanText(oneLine(item.getStr()), MaxOrderLen))
+    if item.kind != JString:
+      raise newException(CogplomacyError, fieldName & " entries must be strings")
+    let raw = oneLine(item.getStr()).strip()
+    if raw.runeLen > MaxOrderLen:
+      raise newException(CogplomacyError, fieldName & " entry exceeds max length: " &
+        cleanText(raw, MaxOrderLen))
+    result.add(raw)
 
 proc parsePress(sim: Sim, power: int, payload: JsonNode): Decision =
   let broadcast = payload{"broadcast"}
   let letters = payload{"letters"}
-  if (broadcast.isNil or broadcast.kind != JString) and
-      (letters.isNil or letters.kind != JArray):
+  let pledges = payload{"pledges"}
+  if not broadcast.isNil and broadcast.kind != JString:
+    raise newException(CogplomacyError, "broadcast must be a string")
+  if not letters.isNil and letters.kind != JArray:
+    raise newException(CogplomacyError, "letters must be an array")
+  if not pledges.isNil and pledges.kind != JArray:
+    raise newException(CogplomacyError, "pledges must be an array")
+  if broadcast.isNil and letters.isNil:
     raise newException(CogplomacyError, "no broadcast or letters in reply")
-  if not broadcast.isNil and broadcast.kind == JString:
-    result.broadcast = cleanText(oneLine(broadcast.getStr()),
-      MaxBroadcastLen)
-  if not letters.isNil and letters.kind == JArray:
+  if not broadcast.isNil:
+    result.broadcast = cleanText(oneLine(broadcast.getStr()), MaxBroadcastLen)
+  if not letters.isNil:
+    if letters.len > MaxLetters:
+      raise newException(CogplomacyError, "too many letters (max " & $MaxLetters & ")")
+    var seenRecipients: seq[int]
     for item in letters:
-      if result.letters.len >= MaxLetters:
-        break
       if item.kind != JObject:
-        continue
-      ## `to` is a power name or ALL (case-insensitive); an ALL letter is
-      ## published to everybody. Only an unknown recipient is dropped.
-      let toText = item{"to"}.getStr().strip().toUpperAscii()
+        raise newException(CogplomacyError, "letter entry must be an object")
+      let toNode = item{"to"}
+      let textNode = item{"text"}
+      if toNode.isNil or toNode.kind != JString:
+        raise newException(CogplomacyError, "letter.to must be a string")
+      if textNode.isNil or textNode.kind != JString:
+        raise newException(CogplomacyError, "letter.text must be a string")
+      let toText = toNode.getStr().strip().toUpperAscii()
       var to = -1
       if toText != "ALL":
         to = powerByName(toText)
-        if to < 0 or to == power:
-          continue
+        if to < 0:
+          raise newException(CogplomacyError, "unknown letter recipient: " & toText)
+        if to == power:
+          raise newException(CogplomacyError, "cannot send private letter to self")
+        if to in seenRecipients:
+          raise newException(CogplomacyError, "duplicate letter recipient: " & toText)
+        seenRecipients.add(to)
       result.letters.add(Letter(fromPower: power, toPower: to,
-        text: cleanText(oneLine(item{"text"}.getStr()), MaxLetterLen)))
-  let pledges = payload{"pledges"}
-  if not pledges.isNil and pledges.kind == JArray:
+        text: cleanText(oneLine(textNode.getStr()), MaxLetterLen)))
+  if not pledges.isNil:
+    if pledges.len > MaxPledges:
+      raise newException(CogplomacyError, "too many pledges (max " & $MaxPledges & ")")
     for item in pledges:
-      if result.pledges.len >= MaxPledges:
-        break
       if item.kind != JObject:
-        continue
+        raise newException(CogplomacyError, "pledge entry must be an object")
+      let kindNode = item{"kind"}
+      if kindNode.isNil or kindNode.kind != JString:
+        raise newException(CogplomacyError, "pledge.kind must be a string")
       var kind: PledgeKind
-      case item{"kind"}.getStr().strip().toLowerAscii()
+      case kindNode.getStr().strip().toLowerAscii()
       of "peace": kind = plPeace
-      of "keepout", "keep out", "keep-out": kind = plKeepOut
+      of "keepout": kind = plKeepOut
       of "support": kind = plSupport
-      else: continue
-      let toText = item{"to"}.getStr().strip().toUpperAscii()
+      else:
+        raise newException(CogplomacyError, "unknown pledge kind: " & kindNode.getStr())
+      let toNode = item{"to"}
+      if not toNode.isNil and toNode.kind != JString:
+        raise newException(CogplomacyError, "pledge.to must be a string")
+      let toText = if toNode.isNil: "" else: toNode.getStr().strip().toUpperAscii()
       var to = -1
       if toText != "ALL" and toText.len > 0:
         to = powerByName(toText)
         if to < 0:
-          continue
+          raise newException(CogplomacyError, "unknown pledge recipient: " & toText)
+        if kind != plKeepOut and to == power:
+          raise newException(CogplomacyError, "cannot pledge to self")
       var province = -1
       if kind == plKeepOut:
-        province = provinceByCode(item{"province"}.getStr())
+        let provNode = item{"province"}
+        if provNode.isNil or provNode.kind != JString:
+          raise newException(CogplomacyError, "keepout pledge requires province code")
+        province = provinceByCode(provNode.getStr())
         if province < 0:
-          continue
+          raise newException(CogplomacyError, "unknown keepout province: " & provNode.getStr())
       result.pledges.add(Pledge(fromPower: power, toPower: to, kind: kind,
         province: province))
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  result.notes = parseNotesField(payload)
 
-proc parseOrdersReply(payload: JsonNode): Decision =
-  let node = payload{"orders"}
-  if node.isNil or node.kind != JArray:
-    raise newException(CogplomacyError, "no orders array in reply")
-  result.orders = stringList(node, MaxOrdersPerReply)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+proc parseOrdersReply(sim: Sim, power: int, payload: JsonNode): Decision =
+  let raws = strictStringList(payload{"orders"}, "orders", MaxOrdersPerReply)
+  var claimed: seq[int]
+  for raw in raws:
+    let parsed = parseOrder(sim.board, power, raw)
+    if parsed.illegal:
+      raise newException(CogplomacyError, "illegal order (" & parsed.why & "): " & raw)
+    if parsed.unit.province in claimed:
+      raise newException(CogplomacyError, "duplicate order for unit " & unitLabel(parsed.unit))
+    claimed.add(parsed.unit.province)
+    result.orders.add(formatOrder(parsed))
+  for unit in sim.board.units:
+    if unit.power == power and unit.province notin claimed:
+      raise newException(CogplomacyError, "missing order for unit " & unitLabel(unit))
+  result.notes = parseNotesField(payload)
 
-proc parseRetreatsReply(payload: JsonNode): Decision =
-  let node = payload{"retreats"}
-  if node.isNil or node.kind != JArray:
-    raise newException(CogplomacyError, "no retreats array in reply")
-  result.retreats = stringList(node, MaxRetreatsPerReply)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+proc parseRetreatsReply(sim: Sim, power: int, payload: JsonNode): Decision =
+  let raws = strictStringList(payload{"retreats"}, "retreats", MaxRetreatsPerReply)
+  var handled: seq[int]
+  for raw in raws:
+    let parsed = parseRetreat(sim.board, power, raw, sim.dislodged, sim.standoffs)
+    if not parsed.ok:
+      raise newException(CogplomacyError, "illegal retreat (" & parsed.why & "): " & raw)
+    if parsed.unit.province in handled:
+      raise newException(CogplomacyError, "duplicate retreat for unit " & unitLabel(parsed.unit))
+    handled.add(parsed.unit.province)
+    result.retreats.add(unitLabel(parsed.unit) & " - " &
+      (if parsed.to < 0: "D" else: provinceCode(parsed.to) &
+        (if parsed.coast.len > 0: "/" & parsed.coast else: "")))
+  for item in sim.dislodged:
+    if item.unit.power == power and item.unit.province notin handled:
+      raise newException(CogplomacyError, "missing retreat for dislodged unit " &
+        unitLabel(item.unit))
+  result.notes = parseNotesField(payload)
 
-proc parseBuildsReply(payload: JsonNode): Decision =
-  let node = payload{"adjustments"}
-  if node.isNil or node.kind != JArray:
-    raise newException(CogplomacyError, "no adjustments array in reply")
-  result.adjustments = stringList(node, MaxAdjustmentsPerReply)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+proc parseBuildsReply(sim: Sim, power: int, payload: JsonNode): Decision =
+  let raws = strictStringList(payload{"adjustments"}, "adjustments", MaxAdjustmentsPerReply)
+  let delta = sim.buildDelta(power)
+  var used: seq[int]
+  for raw in raws:
+    let parsed = parseAdjustment(sim.board, power, raw)
+    if not parsed.ok:
+      raise newException(CogplomacyError, "illegal adjustment (" & parsed.why & "): " & raw)
+    if delta > 0 and not parsed.build:
+      raise newException(CogplomacyError, "expected BUILD adjustment, got: " & raw)
+    if delta < 0 and parsed.build:
+      raise newException(CogplomacyError, "expected DISBAND adjustment, got: " & raw)
+    if parsed.unit.province in used:
+      raise newException(CogplomacyError, "duplicate adjustment for province " &
+        provinceCode(parsed.unit.province))
+    used.add(parsed.unit.province)
+    result.adjustments.add((if parsed.build: "BUILD " else: "DISBAND ") &
+      unitLabel(parsed.unit))
+  if delta > 0 and result.adjustments.len > delta:
+    raise newException(CogplomacyError, "too many builds: " & $result.adjustments.len &
+      " > " & $delta)
+  if delta < 0 and result.adjustments.len != -delta:
+    raise newException(CogplomacyError, "must disband exactly " & $(-delta) &
+      " units, got " & $result.adjustments.len)
+  result.notes = parseNotesField(payload)
 
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
-  ## A reply is invalid only when it is not a JSON object or the phase's
-  ## required key is missing or of the wrong kind. Illegal CONTENTS — a bad
-  ## order, an unknown recipient — are repaired, never rejected.
+  ## Validates and parses a model reply for the current phase. Any structural
+  ## error, illegal action, or missing required unit order raises
+  ## `CogplomacyError` instead of silently repairing or synthesizing fallbacks.
   if payload.isNil or payload.kind != JObject:
     raise newException(CogplomacyError, "reply is not a JSON object")
   case sim.phase
   of pkPress: parsePress(sim, sim.powerOf[seat], payload)
-  of pkOrders: parseOrdersReply(payload)
-  of pkRetreats: parseRetreatsReply(payload)
-  of pkBuilds: parseBuildsReply(payload)
+  of pkOrders: parseOrdersReply(sim, sim.powerOf[seat], payload)
+  of pkRetreats: parseRetreatsReply(sim, sim.powerOf[seat], payload)
+  of pkBuilds: parseBuildsReply(sim, sim.powerOf[seat], payload)
   of pkDone: Decision()
 
 proc decisionReply*(decision: Decision, phase: PhaseKind): JsonNode =
@@ -839,19 +955,24 @@ proc decideAll*(
   scripted: seq[ScriptKind]
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order, for the CURRENT phase.
-  ## Every live seat's request goes out in ONE parallel batch — this is a
-  ## simultaneous-decision game and a serial loop would blow the play
-  ## budget. Never raises: any failure falls back to the scripted baseline
-  ## so the episode always advances.
+  ## Every live model seat's request goes out in ONE parallel batch.
+  ## Explicit scripted seats run deterministically; non-scripted model seats
+  ## require an active LLM endpoint and raise `DecisionFailure` if no endpoint
+  ## is configured or if the model reply still fails after one retry.
   result = newSeq[Decision](seats.len)
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   var open: seq[int]
+  var lastErrors = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedDecision(sim, seat,
-        (if kind == skNone: skExpander else: kind))
+    if kind != skNone:
+      result[index] = scriptedDecision(sim, seat, kind)
+    elif client.disabled:
+      var err = newException(DecisionFailure,
+        "no LLM endpoint or credentials configured for model seat " & $seat)
+      err.seat = seat
+      raise err
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -864,8 +985,8 @@ proc decideAll*(
       let seat = seats[index]
       var user = sim.userPrompt(seat, prompts[seat])
       if attempt > 0:
-        user.add("\n\nYour previous reply was invalid. Respond with ONLY " &
-          "the requested JSON object.")
+        user.add("\n\nYour previous reply was rejected (" & lastErrors[index] &
+          "). Respond with ONLY the requested valid JSON object.")
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
       if capture:
         pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
@@ -904,12 +1025,19 @@ proc decideAll*(
             evidence.rejectionReason = some("native parser normalized the proposal")
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
+        lastErrors[index] = error.msg
         echo "cogplomacy llm: seat ", seat, " attempt ", attempt,
           " failed: ", error.msg
         stillOpen.add(index)
       if capture: client.nativeAttempts[seat].add(evidence)
     open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    echo "cogplomacy: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedDecision(sim, seat, skExpander)
+  if open.len > 0:
+    let failedIndex = open[0]
+    let seat = seats[failedIndex]
+    let reason =
+      if lastErrors[failedIndex].len > 0: lastErrors[failedIndex]
+      else: "model decision failed for seat " & $seat
+    var err = newException(DecisionFailure,
+      "seat " & $seat & " failed: " & reason)
+    err.seat = seat
+    raise err

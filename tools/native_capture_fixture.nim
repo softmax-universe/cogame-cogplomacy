@@ -38,21 +38,24 @@ while not game.done:
       proposal["letters"] = %*[{"to": PowerNames[(game.powerOf[seat] + 1) mod Seats],
         "text": "PRIVATE_LETTER_" & $seat}]
     if phaseIndex == 2: proposal["notes"] = %("é".repeat(5000))
-    if phaseIndex == 3 and phase == pkOrders: proposal["orders"] = %*["A NOT_A_PROVINCE - NOPE"]
     if phaseIndex == 4: proposal.delete("notes")
-    let text = $proposal
-    if phaseIndex in [0, 1]:
-      requests.add(%*{"slot": seat, "system": system, "user": user, "response": "invalid fixture reply"})
+    let text =
+      if phaseIndex == 3: "```json\n" & $proposal & "\n```"
+      else: $proposal
+    if phaseIndex == 1:
+      let invalidText = "invalid fixture reply"
+      let errMsg = "expected JSON object in response: " & invalidText
+      requests.add(%*{"slot": seat, "system": system, "user": user, "response": invalidText})
       requests.add(%*{"slot": seat, "system": system,
-        "user": user & "\n\nYour previous reply was invalid. Respond with ONLY the requested JSON object.",
-        "response": (if phaseIndex == 0: "invalid fixture reply" else: text)})
+        "user": user & "\n\nYour previous reply was rejected (" & errMsg &
+          "). Respond with ONLY the requested valid JSON object.",
+        "response": text})
     else:
       requests.add(%*{"slot": seat, "system": system, "user": user, "response": text})
-    decisions[seat] = if phaseIndex == 0: scriptedDecision(game, seat, skExpander)
-      else: game.parseDecision(seat, proposal)
+    decisions[seat] = game.parseDecision(seat, proposal)
   for seat in seats:
     let eventIndex = game.events.len
-    game.apply(seat, decisions[seat], phaseIndex == 0)
+    game.apply(seat, decisions[seat], false)
     let event = game.events[eventIndex]
     doAssert event.kind in {evPress, evOrders, evRetreat, evBuild}
     expected.add(%*{"event_index": eventIndex, "seat": seat, "observation": views[seat],

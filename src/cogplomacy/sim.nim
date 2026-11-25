@@ -749,7 +749,7 @@ proc applyRetreats*(sim: var Sim, seat: int, raws: seq[string], notes: string,
 
 # ---- Winter adjustments -----------------------------------------------------
 
-proc civilDisorderPick(sim: Sim, power: int, already: seq[int]): int =
+proc civilDisorderPick*(sim: Sim, power: int, already: seq[int]): int =
   ## The unit furthest from the nearest home centre the power still owns, on
   ## its own movement graph; ties by province code.
   result = -1

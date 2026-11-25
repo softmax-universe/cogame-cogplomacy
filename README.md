@@ -29,8 +29,9 @@ coworld upload-policy coworld-cogplomacy:latest \
 Two scripted baselines ship in the same image and are selected with `PLAYER_SCRIPTED`:
 `expander` (the greedy bot: take an unowned neutral centre, else an undefended rival centre, else
 close the distance; never stand yourself off) and `hedgehog` (the wall: everything holds and props
-up its neighbours). They are also the fallback for any decision that fails, and every seat plays
-one when there are no LLM credentials — which is what lets certification complete offline.
+up its neighbours). Certification seats explicitly select these baselines so offline certification
+completes deterministically. Non-scripted model seats require a configured LLM endpoint and fail
+explicitly on invalid or failed replies rather than falling back to a baseline.
 
 ---
 
