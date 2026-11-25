@@ -608,12 +608,16 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add(operatorBlock(prompt))
   case sim.phase
   of pkPress:
+    var places: seq[string]
+    for province in Provinces:
+      places.add(province.name & "=" & province.code)
     result.add("Send a broadcast or letters. Minimum reply: {\"letters\":[]}\n" &
       "Optional broadcast (up to " & $MaxBroadcastLen & " characters), letters " &
       "(up to " & $MaxLetters & ", each with to and text up to " & $MaxLetterLen &
       " characters, one per power), and pledges (up to " & $MaxPledges &
       ", each with kind and optional to). Kinds: peace, support, or keepout " &
-      "(requires province). Spectators can see broken pledges.")
+      "(use a three-letter province code, e.g. {\"kind\":\"keepout\",\"province\":\"TRI\"}). " &
+      "Province codes: " & places.join(", ") & ". Spectators can see broken pledges.")
   of pkOrders:
     var example: seq[string]
     result.add(sim.legalOrdersBlock(power, example))
