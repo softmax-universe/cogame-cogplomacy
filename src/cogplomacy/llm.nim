@@ -622,7 +622,7 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     var example: seq[string]
     result.add(sim.legalOrdersBlock(power, example))
     result.add("Copy one complete order per unit. A supporting unit must itself " &
-      "be able to move to the supported destination. Minimum reply: " &
+      "be able to move to the supported destination. Only the moving army appends VIA CONVOY; support orders end at the destination code. Minimum reply: " &
       $(%*{"orders": example}))
   of pkRetreats:
     result.add(sim.retreatBlock(power))
