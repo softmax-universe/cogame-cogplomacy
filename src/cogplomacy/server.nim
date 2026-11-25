@@ -163,16 +163,12 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.tableStateJson())
 
-proc writePlayerFailure(failedSeat: int, reason: string) =
+proc writePlayerFailure(failure: JsonNode) =
   ## Atomically publishes a typed GamePlayerFailure to COGAME_PLAYER_FAILURE_URI.
   let uri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
   if uri.len == 0:
     return
-  let message = cleanText(oneLine(reason), 2000)
-  let payload = $ %*{
-    "message": (if message.len > 0: message else: "player decision failed"),
-    "failed_policy_index": max(failedSeat, 0)
-  }
+  let payload = $failure
   const FilePrefix = "file://"
   if uri.startsWith(FilePrefix):
     let path = uri[FilePrefix.len .. ^1]
@@ -187,17 +183,19 @@ proc writePlayerFailure(failedSeat: int, reason: string) =
     writeArtifact(uri, payload, "application/json",
       "COGAME_PLAYER_FAILURE_METHOD")
 
-proc failEpisode(failedSeat: int, reason: string) =
+proc failEpisode(failedSeat: int, reason: string, kind = fkPlayerError) =
   ## Terminal explicit player failure: write GamePlayerFailure (never normal
   ## results/replay), preserve trajectory evidence if enabled, and exit nonzero.
   let cleanReason = cleanText(oneLine(reason), 2000)
+  let failure = %*{"message": (if cleanReason.len > 0: cleanReason else: "player decision failed"),
+    "failed_policy_index": failedSeat, "kind": $kind}
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
-    state.trajectory.finishFailedTrajectory(failedSeat, cleanReason)
+    state.trajectory.finishFailedTrajectory(failure)
   echo "cogplomacy: failing episode (slot ", failedSeat, "): ", cleanReason
-  writePlayerFailure(failedSeat, cleanReason)
+  writePlayerFailure(failure)
   sleep(200)
   quit(1)
 
@@ -395,7 +393,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             client.nativeAttempts[error.seat] else: @[]
           state.trajectory.recordFailedDecision(simCopy.events.len, error.seat,
             config.players[error.seat].name, view, attempts, state.selection, error.msg)
-        failEpisode(error.seat, error.msg)
+        failEpisode(error.seat, error.msg, error.kind)
 
       var applyFailedSeat = -1
       var applyFailedReason = ""

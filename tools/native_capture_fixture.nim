@@ -31,6 +31,8 @@ while not game.done:
     views[seat] = game.observationJson(seat)
     let system = systemPrompt(game, seat, selection)
     let user = userPrompt(game, seat, "PRIVATE_OPERATOR_" & $seat)
+    let minimum = parseJson(user.split("Minimum reply: ")[1].splitLines()[0])
+    discard game.parseDecision(seat, minimum)
     var proposal = scriptedDecision(game, seat, skExpander).decisionReply(phase)
     proposal["notes"] = %("PRIVATE_CAPTURE_" & $seat)
     if phase == pkPress:

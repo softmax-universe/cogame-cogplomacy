@@ -40,6 +40,7 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
       of "template": attempt.chatTemplateSha256 = some(value)
   if transportError.len > 0 or response.code < 200 or response.code >= 300: return
   let payload = parseJson(response.body)
+  if payload.kind != JObject: return
   if payload.hasKey("model") and payload["model"].kind == JString:
     attempt.model = some(payload["model"].getStr())
   if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
@@ -49,7 +50,9 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
     if usage.hasKey("input_tokens") and usage["input_tokens"].kind == JInt: attempt.inputTokens = some(usage["input_tokens"].getInt())
     if usage.hasKey("output_tokens") and usage["output_tokens"].kind == JInt: attempt.outputTokens = some(usage["output_tokens"].getInt())
   var text = ""
-  for part in payload["content"]:
+  let content = payload{"content"}
+  if content.isNil or content.kind != JArray: return
+  for part in content:
     if part{"type"}.getStr() == "text": text.add(part{"text"}.getStr())
   attempt.response = %text
 
@@ -109,11 +112,9 @@ proc recordFailedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: int
   trajectory.recordDecision("event-" & $eventIndex, $seat, view, attempts,
     none(string), newJNull(), asRejected)
 
-proc finishFailedTrajectory*(trajectory: DecisionTrajectory, failedSeat: int,
-    reason: string) =
+proc finishFailedTrajectory*(trajectory: DecisionTrajectory, failure: JsonNode) =
   if trajectory.isNil: return
-  let outcome = %*{"failed_policy_index": failedSeat, "message": reason}
-  trajectory.finish(esFailed, outcome, newJObject())
+  trajectory.finish(esFailed, failure, newJObject())
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
 proc finishNativeTrajectory*(trajectory: DecisionTrajectory, outcome: JsonNode) =

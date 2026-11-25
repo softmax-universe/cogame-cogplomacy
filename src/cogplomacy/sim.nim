@@ -932,8 +932,11 @@ proc observationJson*(sim: Sim, slot: int): JsonNode =
   var own = newJArray()
   for unit in sim.board.units:
     if unit.power == power:
-      own.add(%*{"kind": $unit.kind, "province": provinceCode(unit.province),
-        "coast": unit.coast})
+      var ownUnit = %*{"kind": $unit.kind, "province": provinceCode(unit.province),
+        "coast": unit.coast}
+      if sim.phase == pkOrders:
+        ownUnit["legalOrders"] = %legalOrders(sim.board, unit)
+      own.add(ownUnit)
   var board = newJArray()
   for unit in sim.board.units:
     board.add(%*{"power": PowerNames[unit.power], "kind": $unit.kind,

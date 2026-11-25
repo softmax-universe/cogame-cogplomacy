@@ -2,8 +2,8 @@
 ##
 ##   A PAR H                 hold
 ##   A PAR - BUR             move
-##   A PAR - BUR VIA CONVOY  move, convoy demanded
-##   F BRE S A PAR           support a hold
+##   A LVP - BEL VIA CONVOY  move, convoy demanded
+##   F NAP S A ROM           support a hold
 ##   F BRE S A PAR - PIC     support a move
 ##   F ENG C A LON - BRE     convoy
 ##   F STP/SC - BOT          a fleet on a named coast
@@ -30,7 +30,7 @@ proc locLabel(province: int, coast: string): string =
     result.add("/" & coast)
 
 proc formatOrder*(order: Order): string =
-  ## The canonical string for an order. `A PAR - BUR VIA CONVOY`.
+  ## The canonical string for an order. `A LVP - BEL VIA CONVOY`.
   let head = unitLabel(order.unit)
   case order.kind
   of okHold:
@@ -342,7 +342,7 @@ proc parseOrder*(board: Board, power: int, raw: string): Order =
 # ---- Legal-order enumeration ------------------------------------------------
 
 proc legalOrders*(board: Board, unit: Unit): seq[string] =
-  ## Every order this unit may write this movement phase, in the exact
+  ## Concrete choices this unit may write this movement phase, in the exact
   ## notation a reply must use: hold, moves, support-holds, support-moves,
   ## convoys. Capped at `MaxLegalOrders` defensively.
   var holds: seq[string]

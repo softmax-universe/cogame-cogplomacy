@@ -16,7 +16,7 @@ type
     variant*: PromptVariant
     seed*: int
 
-const PromptBankVersion* = "cogplomacy-rules-v2"
+const PromptBankVersion* = "cogplomacy-rules-v3"
 
 proc promptSelection*(node: JsonNode): PromptSelection =
   if node.kind != JObject:

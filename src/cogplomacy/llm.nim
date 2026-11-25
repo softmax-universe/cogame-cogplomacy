@@ -36,8 +36,13 @@ const
   Far = high(int) div 4
 
 type
+  FailureKind* = enum
+    fkPlayerError = "player_error"
+    fkInconclusive = "episode_inconclusive"
+
   DecisionFailure* = object of CogplomacyError
     seat*: int
+    kind*: FailureKind
 
   ScriptKind* = enum
     skNone = "none"
@@ -550,15 +555,17 @@ proc pressBlock(sim: Sim, power: int): string =
   "PRESS YOU HAVE RECEIVED:\n" &
     (if lines.len > 0: lines.join("\n") else: "(none)") & "\n\n"
 
-proc legalOrdersBlock(sim: Sim, power: int): string =
+proc legalOrdersBlock(sim: Sim, power: int, example: var seq[string]): string =
   var blocks: seq[string]
   var mine = sim.unitsOf(power)
   mine.sort(proc (a, b: Unit): int =
     cmp(provinceCode(a.province), provinceCode(b.province)))
   for unit in mine:
+    let choices = legalOrders(sim.board, unit)
+    example.add(choices[0])
     blocks.add(unitLabel(unit) & " in " & provinceName(unit.province) & ":\n  " &
-      legalOrders(sim.board, unit).join("\n  "))
-  "YOUR UNITS AND EVERY LEGAL ORDER:\n" & blocks.join("\n") & "\n\n"
+      choices.join("\n  "))
+  "LEGAL CHOICES BY UNIT:\n" & blocks.join("\n") & "\n\n"
 
 proc retreatBlock(sim: Sim, power: int): string =
   var lines: seq[string]
@@ -601,33 +608,37 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add(operatorBlock(prompt))
   case sim.phase
   of pkPress:
-    result.add("Reply with ONLY {\"broadcast\":\"…\"," &
-      "\"letters\":[{\"to\":\"ITALY\",\"text\":\"…\"}]," &
-      "\"pledges\":[{\"to\":\"ITALY\",\"kind\":\"peace\"}],\"notes\":\"…\"}" &
-      " — broadcast at most " & $MaxBroadcastLen & " characters, at most " &
-      $MaxLetters & " letters of at most " & $MaxLetterLen &
-      " characters each (one per power), at most " & $MaxPledges &
-      " pledges, notes at most " & $MaxNotesLen & " characters. A pledge " &
-      "kind is peace, keepout (with a \"province\" code) or support. A " &
-      "pledge is the only promise spectators can see you break; free text " &
-      "is never checked.")
+    result.add("Send a broadcast or letters. Minimum reply: {\"letters\":[]}\n" &
+      "Optional broadcast (up to " & $MaxBroadcastLen & " characters), letters " &
+      "(up to " & $MaxLetters & ", each with to and text up to " & $MaxLetterLen &
+      " characters, one per power), and pledges (up to " & $MaxPledges &
+      ", each with kind and optional to). Kinds: peace, support, or keepout " &
+      "(requires province). Spectators can see broken pledges.")
   of pkOrders:
-    result.add(sim.legalOrdersBlock(power))
-    result.add("Reply with ONLY {\"orders\":[\"A PAR - BUR\"," &
-      "\"F BRE S A PAR - BUR\"],\"notes\":\"…\"} — exactly one legal order per " &
-      "unit, copied from the list above.")
+    var example: seq[string]
+    result.add(sim.legalOrdersBlock(power, example))
+    result.add("Copy one complete order per unit. A supporting unit must itself " &
+      "be able to move to the supported destination. Minimum reply: " &
+      $(%*{"orders": example}))
   of pkRetreats:
     result.add(sim.retreatBlock(power))
-    result.add("Reply with ONLY {\"retreats\":[\"A VIE - TYR\"]," &
-      "\"notes\":\"…\"} — exactly one legal entry per dislodged unit; " &
-      "\"A VIE - D\" disbands it.")
+    var example: seq[string]
+    for item in sim.dislodged:
+      if item.unit.power == power:
+        example.add(unitLabel(item.unit) & " - D")
+    result.add("Choose one listed retreat or disband per dislodged unit. Minimum reply: " &
+      $(%*{"retreats": example}))
   of pkBuilds:
     result.add(sim.buildBlock(power))
-    result.add("Reply with ONLY {\"adjustments\":[\"BUILD A PAR\"]," &
-      "\"notes\":\"…\"} (or \"DISBAND F BRE\" when you must remove units; " &
-      "use [] only when waiving builds or when no build sites are available).")
+    var example: seq[string]
+    let delta = sim.buildDelta(power)
+    if delta < 0:
+      example = legalDisbands(sim.board, power)[0 ..< -delta]
+    result.add("Choose legal adjustments. You can waive builds. Minimum reply: " &
+      $(%*{"adjustments": example}))
   of pkDone:
-    discard
+    return
+  result.add("\nOptional notes: a string up to " & $MaxNotesLen & " characters.")
 
 # ---- Reply parsing ----------------------------------------------------------
 
@@ -913,6 +924,21 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc failureKind(response: Response, transportError: string): FailureKind =
+  if transportError.len > 0 or response.code >= 500 or
+      response.code in [401, 403, 408]:
+    return fkInconclusive
+  if response.code == 429:
+    # The native sidecar uses 429 for both seat spend limits and throttling.
+    try:
+      let message = parseJson(response.body){"error", "message"}.getStr()
+      if message.startsWith("episode LLM spend limit reached"):
+        return fkPlayerError
+    except JsonParsingError:
+      discard
+    return fkInconclusive
+  fkPlayerError
+
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
   ## The text of one batched reply, or a CogplomacyError describing why
@@ -939,7 +965,10 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(CogplomacyError, "anthropic refusal")
-  for contentBlock in payload["content"]:
+  let content = payload{"content"}
+  if content.isNil or content.kind != JArray:
+    raise newException(CogplomacyError, "llm response requires a content array")
+  for contentBlock in content:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
@@ -963,6 +992,7 @@ proc decideAll*(
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   var open: seq[int]
+  var failureKinds = newSeq[FailureKind](seats.len)
   var lastErrors = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
@@ -971,6 +1001,7 @@ proc decideAll*(
     elif client.disabled:
       var err = newException(DecisionFailure,
         "no LLM endpoint or credentials configured for model seat " & $seat)
+      err.kind = fkInconclusive
       err.seat = seat
       raise err
     else:
@@ -984,7 +1015,7 @@ proc decideAll*(
     for index in open:
       let seat = seats[index]
       var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
+      if attempt > 0 and failureKinds[index] == fkPlayerError:
         user.add("\n\nYour previous reply was rejected (" & lastErrors[index] &
           "). Respond with ONLY the requested valid JSON object.")
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
@@ -999,6 +1030,8 @@ proc decideAll*(
       let seat = seats[index]
       var evidence: DecisionAttempt
       if capture: evidence = pendingEvidence[position]
+      let response = responses[position].response
+      failureKinds[index] = failureKind(response, responses[position].error)
       try:
         if capture:
           evidence.receiveNativeResponse(responses[position].response,
@@ -1039,5 +1072,6 @@ proc decideAll*(
       else: "model decision failed for seat " & $seat
     var err = newException(DecisionFailure,
       "seat " & $seat & " failed: " & reason)
+    err.kind = failureKinds[failedIndex]
     err.seat = seat
     raise err
