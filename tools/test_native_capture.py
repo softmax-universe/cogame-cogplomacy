@@ -64,7 +64,7 @@ def run(game, player, fixture_generator, output, variant, capture, model_enabled
         seed=42,
         turnDelayMs=0,
         players=[{"name": f"SPECTATOR_POLICY_{i}"} for i in range(seats)],
-        llmTimeoutSeconds=1,
+        llmTimeoutSeconds=10,
         playerConnectTimeoutSeconds=5,
         episodeTimeoutSeconds=600,
         tokens=[f"fixture-{i}" for i in range(seats)],
